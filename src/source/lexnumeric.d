@@ -67,7 +67,14 @@ mixin template LexNumericImpl(
 
 		int exponent = 0;
 		ulong mantissa = 0;
-		popFun!decode(mantissa);
+
+		/++
+			`mantissa` can end up as the value of an integer literal, so we keep
+			track of whether there was an overflow while popping digits.
+		 +/
+		bool mantissaOverflow = false;
+
+		const count = popFun!decode(mantissa, mantissaOverflow);
 
 		bool isFloat = false;
 		bool hasExponent = false;
@@ -82,7 +89,9 @@ mixin template LexNumericImpl(
 			}
 
 			if (isFun(frontChar)) {
-				exponent -= popFun!decode(mantissa) * ExponentScaleFactor;
+				bool dummyOverflow = false;
+				exponent -= popFun!decode(mantissa, dummyOverflow)
+					* ExponentScaleFactor;
 				isFloat = true;
 				goto LexExponent;
 			}
@@ -119,8 +128,13 @@ mixin template LexNumericImpl(
 				return getError(begin, "Float literal is missing exponent.");
 			}
 
+			bool exponentOverflow = false;
 			ulong value = 0;
-			popDecimal!decode(value);
+			popDecimal!decode(value, exponentOverflow);
+			if (exponentOverflow) {
+				return getError(begin,
+				                "This float literal's exponent overflowed.");
+			}
 
 			import util.math;
 			exponent += maybeNegate(value, neg);
@@ -131,6 +145,13 @@ mixin template LexNumericImpl(
 		}
 
 	LexIntegral:
+		if (mantissaOverflow) {
+			return getError(
+				begin,
+				"This integer literal overflowed (it cannot be represented within a 64 bit unsigned integer)."
+			);
+		}
+
 		return lexIntegralSuffix(begin, mantissa);
 
 	LexFloat:
@@ -229,7 +250,7 @@ mixin template LexNumericImpl(
 		return (c >= '0' && c <= '9') || (hc >= 'a' && hc <= 'f');
 	}
 
-	uint popHexadecimal(bool decode)(ref ulong result) {
+	uint popHexadecimal(bool decode)(ref ulong result, out bool overflowed) {
 		uint count = 0;
 		while (true) {
 			while (frontChar == '_') {
@@ -299,7 +320,7 @@ mixin template LexNumericImpl(
 		return c >= '0' && c <= '9';
 	}
 
-	uint popDecimal(bool decode)(ref ulong result) {
+	uint popDecimal(bool decode)(ref ulong result, out bool overflowed) {
 		uint count = 0;
 		while (true) {
 			while (frontChar == '_') {
@@ -308,11 +329,27 @@ mixin template LexNumericImpl(
 
 			import source.swar.dec;
 
+			// Returns true on overflow
+			bool shiftDecPlaceAndAdd(uint places, uint add) {
+				static immutable uint[9] POWERS_OF_10 =
+					[1, 10, 100, 1000, 10_000, 100_000, 1000_000, 10_000_000,
+					 100_000_000];
+				assert(places < POWERS_OF_10.length);
+				const mult = POWERS_OF_10.ptr[places];
+				if (result <= ((typeof(result).max - add) / mult)) {
+					result *= mult;
+					result += add;
+					return false;
+				} else {
+					return true;
+				}
+			}
+
 			ulong state;
 			while (startsWith8DecDigits(remainingContent, state)) {
 				if (decode) {
-					result *= 100000000;
-					result += parseDecDigits!uint(remainingContent);
+					overflowed |= shiftDecPlaceAndAdd(
+						8, parseDecDigits!uint(remainingContent));
 				}
 
 				count += 8;
@@ -320,13 +357,12 @@ mixin template LexNumericImpl(
 			}
 
 			if (hasMoreDigits(state)) {
-				static immutable uint[8] POWERS_OF_10 =
-					[1, 10, 100, 1000, 10000, 100000, 1000000, 10000000];
-
 				auto digitCount = getDigitCount(state);
 				if (decode) {
-					result *= POWERS_OF_10[digitCount];
-					result += parseDecDigits(remainingContent, digitCount);
+					overflowed |= shiftDecPlaceAndAdd(
+						digitCount,
+						parseDecDigits(remainingContent, digitCount)
+					);
 				}
 
 				count += digitCount;
@@ -526,6 +562,12 @@ unittest {
 	checkLexIntegral(
 		"0b1111111111111111111111111111111111111111111111111111111111111111",
 		18446744073709551615);
+
+	// Check overflow
+	checkLexInvalid(
+		"18446744073709551616",
+		"This integer literal overflowed (it cannot be represented within a 64 bit unsigned integer)."
+	);
 
 	// Underscore.
 	checkLexIntegral("1_", 1);
